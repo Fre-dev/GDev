@@ -3,13 +3,19 @@ from openai import OpenAI
 from langchain.agents import create_openai_functions_agent, AgentExecutor
 from langchain import hub
 from composio_openai import OpenAIProvider
-from fastapi import FastAPI, Request, HTTPException, Query, Path
+from fastapi import FastAPI, Request, HTTPException, Query, Path, BackgroundTasks
+from fastapi.responses import JSONResponse
 from langchain_openai import ChatOpenAI
 import json
 import os
+import tempfile
+import subprocess
+import shutil
+import uuid
+from pathlib import Path as FilePath
 from dotenv import load_dotenv
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from pydantic import BaseModel, Field
 from gitingest import ingest
 
@@ -45,10 +51,36 @@ class RepositoryData(BaseModel):
     description: str
     open_issues_count: int
     issues: List[Dict[str, Any]]
+    
+class AutoFixRequest(BaseModel):
+    owner: str
+    repo: str
+    issue_number: int
+    branch_name: Optional[str] = None
+    commit_message: Optional[str] = None
+
+class AutoFixStatus(BaseModel):
+    task_id: str
+    status: str
+    repository: str
+    issue_number: int
+    branch_name: Optional[str] = None
+    pr_url: Optional[str] = None
+    error: Optional[str] = None
+    
+class AutoFixResult(BaseModel):
+    success: bool
+    pr_url: Optional[str] = None
+    branch_name: str
+    commit_message: str
+    error: Optional[str] = None
 
 # Global variables to store connection state
 connection_initialized = False
 github_tools = None
+
+# Dictionary to track auto-fix tasks
+auto_fix_tasks = {}
 
 async def initialize_github_connection():
     """Initialize GitHub connection if not already done"""
@@ -833,6 +865,507 @@ async def get_issue_statistics(owner: str, repo: str):
         print(f"❌ Error getting issue statistics: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching issue statistics: {str(e)}")
 
+async def run_custom_code_fix(repo_path: str, issue_analysis: IssueAnalysis, branch_name: str) -> Dict[str, Any]:
+    """Run custom code fix using LLM to generate and apply fixes"""
+    try:
+        # Prepare fix prompt based on issue analysis
+        issue_title = issue_analysis.title
+        issue_id = issue_analysis.issue_id
+        suggested_solution = issue_analysis.suggested_solution
+        
+        # Create fix prompt
+        fix_prompt = f"""
+        You are a senior software engineer fixing a GitHub issue. 
+        
+        Issue #{issue_id}: {issue_title}
+        Analysis: {suggested_solution}
+        
+        Please provide the exact code changes needed to fix this issue. 
+        Return your response in the following format:
+        
+        ```bash
+        # Git commands to execute
+        git checkout -b {branch_name}
+        ```
+        
+        ```file:path/to/file
+        # File changes (if any)
+        ```
+        
+        ```bash
+        # Additional git commands
+        git add -A
+        git commit -m "Fix issue #{issue_id}: {issue_title.replace('"', '\\"')}"
+        git push -u origin {branch_name}
+        ```
+        
+        IMPORTANT: For git commit messages, use proper quoting and escape any quotes in the issue title.
+        Only include the actual commands and code changes needed. Be specific and actionable.
+        """
+        
+        print(f"🤖 Generating fix with LLM for issue #{issue_id}")
+        
+        # Generate fix using LLM
+        fix_response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a senior software engineer. Provide exact, actionable code changes and git commands to fix issues."
+                },
+                {
+                    "role": "user",
+                    "content": fix_prompt
+                }
+            ],
+            max_tokens=2000,
+            temperature=0.1
+        )
+        
+        fix_instructions = fix_response.choices[0].message.content
+        print(f"✅ Generated fix instructions:\n{fix_instructions}")
+        
+        # Parse the instructions to extract commands and file changes
+        lines = fix_instructions.split('\n')
+        git_commands = []
+        file_changes = {}
+        current_file = None
+        current_content = []
+        
+        for line in lines:
+            line = line.strip()
+            if line.startswith('```bash'):
+                # Start of git commands
+                continue
+            elif line.startswith('```file:'):
+                # Start of file changes
+                current_file = line.replace('```file:', '').strip()
+                current_content = []
+                continue
+            elif line.startswith('```') and current_file:
+                # End of file changes
+                file_changes[current_file] = '\n'.join(current_content)
+                current_file = None
+                current_content = []
+                continue
+            elif current_file:
+                # Collecting file content
+                current_content.append(line)
+            elif line and not line.startswith('```'):
+                # Git command
+                git_commands.append(line)
+        
+        # Apply file changes first
+        for file_path, content in file_changes.items():
+            full_path = os.path.join(repo_path, file_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            
+            with open(full_path, 'w') as f:
+                f.write(content)
+            print(f"📝 Updated file: {file_path}")
+        
+        # Execute git commands
+        current_dir = os.getcwd()
+        os.chdir(repo_path)
+        
+        for command in git_commands:
+            if command.startswith('git'):
+                print(f"🔄 Executing: {command}")
+                
+                # Handle git commit command specially to avoid space issues
+                if command.startswith('git commit'):
+                    # Extract the commit message from the command
+                    if '-m' in command:
+                        # Find the position of -m and extract everything after it
+                        m_index = command.find(' -m ')
+                        if m_index != -1:
+                            git_cmd = command[:m_index].split()
+                            commit_msg = command[m_index + 4:].strip()
+                            # Remove surrounding quotes if present
+                            if (commit_msg.startswith('"') and commit_msg.endswith('"')) or \
+                               (commit_msg.startswith("'") and commit_msg.endswith("'")):
+                                commit_msg = commit_msg[1:-1]
+                            
+                            result = subprocess.run(
+                                git_cmd + ['-m', commit_msg],
+                                capture_output=True,
+                                text=True,
+                                check=False
+                            )
+                        else:
+                            result = subprocess.run(
+                                command.split(),
+                                capture_output=True,
+                                text=True,
+                                check=False
+                            )
+                    else:
+                        result = subprocess.run(
+                            command.split(),
+                            capture_output=True,
+                            text=True,
+                            check=False
+                        )
+                else:
+                    result = subprocess.run(
+                        command.split(),
+                        capture_output=True,
+                        text=True,
+                        check=False
+                    )
+                
+                if result.returncode != 0:
+                    print(f"⚠️ Command failed: {result.stderr}")
+                    
+                    # Special handling for commit failures - try with a simpler message
+                    if command.startswith('git commit') and 'error: pathspec' in result.stderr:
+                        print("🔄 Trying with simplified commit message...")
+                        simple_commit_msg = f"Fix issue #{issue_id}"
+                        result = subprocess.run(
+                            ['git', 'commit', '-m', simple_commit_msg],
+                            capture_output=True,
+                            text=True,
+                            check=False
+                        )
+                        if result.returncode == 0:
+                            print(f"✅ Commit succeeded with simplified message: {result.stdout}")
+                        else:
+                            print(f"⚠️ Simplified commit also failed: {result.stderr}")
+                    # Continue with other commands
+                else:
+                    print(f"✅ Command succeeded: {result.stdout}")
+        
+        os.chdir(current_dir)
+        
+        # Try to extract PR URL from git remote
+        try:
+            os.chdir(repo_path)
+            remote_result = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            remote_url = remote_result.stdout.strip()
+            
+            # Convert SSH to HTTPS if needed
+            if remote_url.startswith('git@'):
+                remote_url = remote_url.replace('git@github.com:', 'https://github.com/').replace('.git', '')
+            
+            pr_url = f"{remote_url}/compare/main...{branch_name}"
+            
+            os.chdir(current_dir)
+            
+            return {
+                "success": True,
+                "output": fix_instructions,
+                "pr_url": pr_url
+            }
+            
+        except Exception as e:
+            print(f"⚠️ Could not generate PR URL: {e}")
+            os.chdir(current_dir)
+            
+            return {
+                "success": True,
+                "output": fix_instructions,
+                "pr_url": None
+            }
+        
+    except Exception as e:
+        print(f"❌ Error running custom code fix: {e}")
+        return {
+            "success": False,
+            "error": f"Error running custom code fix: {str(e)}"
+        }
+
+async def create_pr_with_composio(owner: str, repo: str, branch_name: str, issue_id: int, issue_title: str) -> Dict[str, Any]:
+    """Create a PR using Composio GitHub tools"""
+    await initialize_github_connection()
+    
+    try:
+        if not github_tools:
+            return {
+                "success": False,
+                "error": "GitHub tools not available"
+            }
+        
+        # Create PR title and body
+        pr_title = f"Fix issue #{issue_id}: {issue_title}"
+        pr_body = f"This PR addresses issue #{issue_id}\n\nAutomatic fix generated by GDev."
+        
+        # Use Composio to create PR
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            tools=github_tools,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant with access to GitHub tools. Create a pull request for the specified branch."
+                },
+                {
+                    "role": "user",
+                    "content": f"Create a pull request for the branch '{branch_name}' in repository '{owner}/{repo}' with title '{pr_title}' and body '{pr_body}'. The base branch should be 'main' or 'master'."
+                },
+            ],
+            tool_choice="required"
+        )
+        
+        result = composio.provider.handle_tool_calls(response=response, user_id=user_id)
+        print(f"🔍 PR creation result: {json.dumps(result, indent=2)}")
+        
+        # Extract PR URL from result
+        pr_url = None
+        if isinstance(result, list):
+            for item in result:
+                if item.get('successful') and item.get('data'):
+                    data = item['data']
+                    if 'html_url' in data:
+                        pr_url = data['html_url']
+                        break
+        
+        if pr_url:
+            return {
+                "success": True,
+                "pr_url": pr_url
+            }
+        else:
+            return {
+                "success": False,
+                "error": "Failed to extract PR URL from response",
+                "raw_response": result
+            }
+        
+    except Exception as e:
+        print(f"❌ Error creating PR with Composio: {e}")
+        return {
+            "success": False,
+            "error": f"Error creating PR: {str(e)}"
+        }
+
+async def auto_fix_background_task(task_id: str, owner: str, repo: str, issue_number: int, branch_name: str, commit_message: str):
+    """Background task to auto-fix an issue"""
+    repo_name = f"{owner}/{repo}"
+    temp_dir = None
+    
+    try:
+        # Update task status
+        auto_fix_tasks[task_id] = {
+            "status": "analyzing",
+            "repository": repo_name,
+            "issue_number": issue_number,
+            "branch_name": branch_name
+        }
+        
+        # Get repository content and issue details
+        repo_content = await get_repository_content(repo_name)
+        repo_issues = await get_repository_issues(repo_name)
+        
+        # Find the specific issue
+        issue = None
+        issues_data = []
+        
+        if isinstance(repo_issues, list):
+            for item in repo_issues:
+                if item.get('successful') and item.get('data'):
+                    data = item['data']
+                    if 'details' in data:
+                        issues_data = data['details']
+                    elif isinstance(data, list):
+                        issues_data = data
+        
+        # Find the specific issue
+        for issue_item in issues_data:
+            if issue_item.get('number') == issue_number:
+                issue = issue_item
+                break
+        
+        if not issue:
+            auto_fix_tasks[task_id]["status"] = "failed"
+            auto_fix_tasks[task_id]["error"] = f"Issue #{issue_number} not found in repository {repo_name}"
+            return
+        
+        # Create repository context
+        repository_info = {
+            'name': repo,
+            'full_name': repo_name,
+            'description': repo_content.get('summary', f'Repository {repo_name}'),
+            'content': repo_content.get('content', {})
+        }
+        
+        # Analyze issue with LLM
+        auto_fix_tasks[task_id]["status"] = "analyzing"
+        issue_analysis = await analyze_issue_with_llm(issue, repository_info)
+        
+        # Create temporary directory for cloning
+        temp_dir = tempfile.mkdtemp(prefix="gdev_autofix_")
+        repo_path = os.path.join(temp_dir, repo)
+        
+        # Update task status
+        auto_fix_tasks[task_id]["status"] = "cloning"
+        
+        # Clone the repository
+        clone_url = f"https://github.com/{owner}/{repo}.git"
+        print(f"🔄 Cloning repository {clone_url} to {repo_path}")
+        
+        clone_result = subprocess.run(
+            ["git", "clone", clone_url, repo_path],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        
+        if clone_result.returncode != 0:
+            auto_fix_tasks[task_id]["status"] = "failed"
+            auto_fix_tasks[task_id]["error"] = f"Failed to clone repository: {clone_result.stderr}"
+            return
+        
+        # Generate branch name if not provided
+        if not branch_name:
+            branch_name = f"fix/issue-{issue_number}-{uuid.uuid4().hex[:8]}"
+        
+        auto_fix_tasks[task_id]["branch_name"] = branch_name
+        
+        # Update task status
+        auto_fix_tasks[task_id]["status"] = "fixing"
+        
+        # Run custom code fix to fix the issue
+        fix_result = await run_custom_code_fix(repo_path, issue_analysis, branch_name)
+        
+        if not fix_result["success"]:
+            auto_fix_tasks[task_id]["status"] = "failed"
+            auto_fix_tasks[task_id]["error"] = fix_result["error"]
+            return
+        
+        # Check if fix created a PR URL
+        pr_url = fix_result.get("pr_url")
+        
+        # If no PR URL was found, try to create one with Composio
+        if not pr_url:
+            auto_fix_tasks[task_id]["status"] = "creating_pr"
+            pr_result = await create_pr_with_composio(owner, repo, branch_name, issue_number, issue_analysis.title)
+            
+            if pr_result["success"]:
+                pr_url = pr_result["pr_url"]
+            else:
+                auto_fix_tasks[task_id]["status"] = "partial_success"
+                auto_fix_tasks[task_id]["error"] = f"Fixed issue but failed to create PR: {pr_result.get('error')}"
+                return
+        
+        # Update task status to completed
+        auto_fix_tasks[task_id]["status"] = "completed"
+        auto_fix_tasks[task_id]["pr_url"] = pr_url
+        
+    except Exception as e:
+        print(f"❌ Error in auto-fix background task: {e}")
+        auto_fix_tasks[task_id]["status"] = "failed"
+        auto_fix_tasks[task_id]["error"] = str(e)
+    
+    finally:
+        # Clean up temporary directory
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+                print(f"🧹 Cleaned up temporary directory: {temp_dir}")
+            except Exception as e:
+                print(f"⚠️ Warning: Failed to clean up temporary directory: {e}")
+
+@app.post("/repository/{owner}/{repo}/issues/{issue_number}/auto-fix", response_model=AutoFixStatus)
+async def auto_fix_issue(owner: str, repo: str, issue_number: int, request: AutoFixRequest, background_tasks: BackgroundTasks):
+    """Auto-fix an issue using Claude Code and create a PR"""
+    # Generate task ID
+    task_id = str(uuid.uuid4())
+    
+    # Get branch name and commit message from request or generate defaults
+    branch_name = request.branch_name or f"fix/issue-{issue_number}-{uuid.uuid4().hex[:8]}"
+    commit_message = request.commit_message or f"Fix issue #{issue_number}"
+    
+    # Initialize task status
+    auto_fix_tasks[task_id] = {
+        "status": "pending",
+        "repository": f"{owner}/{repo}",
+        "issue_number": issue_number,
+        "branch_name": branch_name
+    }
+    
+    # Start background task
+    background_tasks.add_task(
+        auto_fix_background_task,
+        task_id,
+        owner,
+        repo,
+        issue_number,
+        branch_name,
+        commit_message
+    )
+    
+    return AutoFixStatus(
+        task_id=task_id,
+        status="pending",
+        repository=f"{owner}/{repo}",
+        issue_number=issue_number,
+        branch_name=branch_name
+    )
+
+@app.get("/auto-fix/{task_id}", response_model=AutoFixStatus)
+async def get_auto_fix_status(task_id: str):
+    """Get the status of an auto-fix task"""
+    if task_id not in auto_fix_tasks:
+        raise HTTPException(status_code=404, detail="Auto-fix task not found")
+    
+    task_info = auto_fix_tasks[task_id]
+    
+    return AutoFixStatus(
+        task_id=task_id,
+        status=task_info.get("status", "unknown"),
+        repository=task_info.get("repository", ""),
+        issue_number=task_info.get("issue_number", 0),
+        branch_name=task_info.get("branch_name"),
+        pr_url=task_info.get("pr_url"),
+        error=task_info.get("error")
+    )
+
+@app.post("/repository/{owner}/{repo}/issues/{issue_number}/auto-fix/vaultsense", response_model=AutoFixStatus)
+async def auto_fix_vaultsense_issue(owner: str, repo: str, issue_number: int, request: AutoFixRequest, background_tasks: BackgroundTasks):
+    """Auto-fix an issue in the VaultSense repository using Claude Code and create a PR"""
+    # Override the repository to always be VaultSense
+    owner = "Fre-dev"
+    repo = "VaultSense"
+    
+    # Generate task ID
+    task_id = str(uuid.uuid4())
+    
+    # Get branch name and commit message from request or generate defaults
+    branch_name = request.branch_name or f"fix/issue-{issue_number}-{uuid.uuid4().hex[:8]}"
+    commit_message = request.commit_message or f"Fix issue #{issue_number}"
+    
+    # Initialize task status
+    auto_fix_tasks[task_id] = {
+        "status": "pending",
+        "repository": f"{owner}/{repo}",
+        "issue_number": issue_number,
+        "branch_name": branch_name
+    }
+    
+    # Start background task
+    background_tasks.add_task(
+        auto_fix_background_task,
+        task_id,
+        owner,
+        repo,
+        issue_number,
+        branch_name,
+        commit_message
+    )
+    
+    return AutoFixStatus(
+        task_id=task_id,
+        status="pending",
+        repository=f"{owner}/{repo}",
+        issue_number=issue_number,
+        branch_name=branch_name
+    )
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
@@ -840,7 +1373,8 @@ async def health_check():
         "status": "healthy", 
         "github_connected": connection_initialized,
         "github_tools_available": len(github_tools) if github_tools else 0,
-        "available_tools": [tool.get('function', {}).get('name', 'Unknown') for tool in github_tools] if github_tools else []
+        "available_tools": [tool.get('function', {}).get('name', 'Unknown') for tool in github_tools] if github_tools else [],
+        "auto_fix_tasks": len(auto_fix_tasks)
     }
 
 if __name__ == "__main__":
